@@ -1249,4 +1249,32 @@ describe("graduated response (soft/hard termination)", () => {
     expect(result.intercepted).toBe(false);
     expect(toolResults).toHaveLength(1);
   });
+
+  it("suppresses converter for skipped events with empty tool_call payload (no_args streamed)", async () => {
+    // Regression: cursor-agent emits a 'started'-style tool_call event with
+    // an empty payload (e.g. {editToolCall: {}}). The extractor returns
+    // {action: "skip", skipReason: "event_skipped"}. Without this fix, the
+    // converter forwarded the bare name as an OpenAI SSE delta with empty
+    // arguments, and opencode's tool dispatcher then invoked the edit
+    // hook with {} args, throwing "missing required argument 'path'".
+    const result = await handleToolLoopEventV1({
+      ...createBaseOptions({
+        event: {
+          type: "tool_call",
+          call_id: "c_empty_edit",
+          tool_call: {
+            // Empty payload — no `args`, no other keys.
+            editToolCall: {},
+          },
+        } as any,
+        allowedToolNames: new Set(["edit", "read", "write"]),
+        toolSchemaMap: EDIT_WRITE_SCHEMA_MAP,
+      }),
+      boundary: createProviderBoundary("v1", "cursor-acp"),
+    });
+
+    expect(result.intercepted).toBe(false);
+    expect(result.skipConverter).toBe(true);
+    expect(result.terminate).toBeUndefined();
+  });
 });

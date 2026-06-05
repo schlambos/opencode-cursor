@@ -163,7 +163,20 @@ export async function handleToolLoopEventLegacy(
       }
     }
 
-    return { intercepted: false, skipConverter: suppressConverterToolEvents };
+    // If the skip is because the event had no extractable args (e.g. a
+    // streamed "started" emission from cursor-agent with an empty
+    // tool_call payload), suppress the converter for this event. Letting
+    // the converter forward it produces an SSE delta with name=<tool> and
+    // empty arguments, which opencode's tool dispatcher then invokes with
+    // {} args, throwing "missing required argument" at the hook layer for
+    // a call that was never meant to execute.
+    const skipReason = (extraction as any).skipReason;
+    const forceSkipConverter =
+      skipReason === "event_skipped" || skipReason === "no_name";
+    return {
+      intercepted: false,
+      skipConverter: suppressConverterToolEvents || forceSkipConverter,
+    };
   }
 
   // Handle intercept: known OpenCode tool
@@ -333,7 +346,20 @@ export async function handleToolLoopEventV1(
       }
     }
 
-    return { intercepted: false, skipConverter: suppressConverterToolEvents };
+    // If the skip is because the event had no extractable args (e.g. a
+    // streamed "started" emission from cursor-agent with an empty
+    // tool_call payload), suppress the converter for this event. Letting
+    // the converter forward it produces an SSE delta with name=<tool> and
+    // empty arguments, which opencode's tool dispatcher then invokes with
+    // {} args, throwing "missing required argument" at the hook layer for
+    // a call that was never meant to execute.
+    const skipReason = (extraction as any).skipReason;
+    const forceSkipConverter =
+      skipReason === "event_skipped" || skipReason === "no_name";
+    return {
+      intercepted: false,
+      skipConverter: suppressConverterToolEvents || forceSkipConverter,
+    };
   }
 
   // Handle intercept: known OpenCode tool
