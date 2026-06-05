@@ -1252,17 +1252,18 @@ describe("tool schema compatibility", () => {
       expect(out.path).toBeUndefined();
     });
 
-    it("leaves args untouched when target file does not exist (creation path)", () => {
+    it("sets old_string='' for creation when target file does not exist", () => {
       const nonexistent = `/tmp/cursor-acp-create-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
       const out = preprocessEditWriteArgs("edit", {
         filePath: nonexistent,
         streamContent: "fresh content\n",
       });
       expect(out.path).toBe(nonexistent);
-      // new_string filled from streamContent, but no old_string set (handler
-      // will create the file via its ENOENT branch).
       expect(out.new_string).toBe("fresh content\n");
-      expect(out.old_string).toBeUndefined();
+      // For non-existent files, old_string="" so the local registry's edit
+      // handler passes its required-type check and reaches its ENOENT
+      // branch (which creates the file with new_string).
+      expect(out.old_string).toBe("");
     });
   });
 });

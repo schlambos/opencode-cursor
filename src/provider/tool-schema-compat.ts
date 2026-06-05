@@ -336,12 +336,14 @@ export function preprocessEditWriteArgs(toolName: string, args: JsonRecord): Jso
       && typeof out.old_string !== "string"
     ) {
       let existing: string | null = null;
+      let fileMissing = false;
       try {
         const stat = fs.statSync(out.path);
         if (stat.isFile()) {
           existing = fs.readFileSync(out.path, "utf8");
         }
       } catch {
+        fileMissing = true;
         // File doesn't exist — leave as-is, registry will create.
       }
       if (existing !== null) {
@@ -363,8 +365,20 @@ export function preprocessEditWriteArgs(toolName: string, args: JsonRecord): Jso
             path: out.path,
             newStringLen: out.new_string.length,
           });
-          out.old_string = " __cursor_acp_unmappable_edit__ ";
+          out.old_string = "__cursor_acp_unmappable_edit__";
         }
+      } else if (fileMissing) {
+        // File does not exist. Set old_string="" so the local registry's
+        // edit handler passes its required-type check (typeof oldString
+        // !== "string") and reaches its ENOENT branch (which creates the
+        // file with new_string). Without this, the handler throws
+        // "missing required argument 'old_string'" before it can create
+        // the file.
+        log.debug("Preprocessed edit args: creating non-existent file via edit (old_string='')", {
+          path: out.path,
+          newStringLen: out.new_string.length,
+        });
+        out.old_string = "";
       }
     }
   }
