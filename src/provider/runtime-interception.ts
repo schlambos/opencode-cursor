@@ -15,6 +15,10 @@ import type { PassThroughTracker } from "./passthrough-tracker.js";
 
 const log = createLogger("provider:runtime-interception");
 
+function isToolLoopSoftBlockEnabled(): boolean {
+  return process.env.CURSOR_ACP_TOOL_LOOP_SOFT_BLOCK !== "false";
+}
+
 interface HandleToolLoopEventBaseOptions {
   event: StreamJsonToolCallEvent;
   toolLoopMode: ToolLoopMode;
@@ -176,6 +180,20 @@ export async function handleToolLoopEventLegacy(
     });
 
     if (compat.validation.hasSchema && !compat.validation.ok) {
+      // Probe reroute first (see v1 path for rationale).
+      const earlyReroute = tryRerouteEditToWrite(
+        normalizedToolCall,
+        compat,
+        allowedToolNames,
+        toolSchemaMap,
+      );
+      if (earlyReroute) {
+        log.debug("Rerouting malformed edit call to write (legacy)", {
+          missing: compat.validation.missing,
+        });
+        await onInterceptedToolCall(earlyReroute);
+        return { intercepted: true, skipConverter: true };
+      }
       const validationTermination = evaluateSchemaValidationLoopGuard(
         toolLoopGuard,
         normalizedToolCall,
@@ -192,20 +210,6 @@ export async function handleToolLoopEventLegacy(
           return { intercepted: false, skipConverter: true };
         }
         return { intercepted: false, skipConverter: true, terminate: validationTermination };
-      }
-
-      const reroutedWrite = tryRerouteEditToWrite(
-        normalizedToolCall,
-        compat,
-        allowedToolNames,
-        toolSchemaMap,
-      );
-      if (reroutedWrite) {
-        log.debug("Rerouting malformed edit call to write (legacy)", {
-          missing: compat.validation.missing,
-        });
-        await onInterceptedToolCall(reroutedWrite);
-        return { intercepted: true, skipConverter: true };
       }
 
       if (shouldEmitNonFatalSchemaValidationHint(normalizedToolCall, compat.validation)) {
@@ -359,6 +363,28 @@ export async function handleToolLoopEventV1(
       typeErrors: compat.validation.typeErrors,
       repairHint: compat.validation.repairHint,
     });
+    // Probe for reroute first: if this malformed edit can be cleanly rerouted
+    // to a valid write call, do it without incrementing the loop guard counter.
+    // Otherwise a model that legitimately appends to CHANGELOG.md (or any single
+    // file) across many turns trips the per-path coarse counter, even though
+    // every call actually succeeded via reroute.
+    const earlyReroute = tryRerouteEditToWrite(
+      normalizedToolCall,
+      compat,
+      allowedToolNames,
+      toolSchemaMap,
+    );
+    if (earlyReroute) {
+      log.debug("Rerouting malformed edit call to write", {
+        missing: compat.validation.missing,
+        typeErrors: compat.validation.typeErrors,
+      });
+      await onInterceptedToolCall(earlyReroute);
+      return {
+        intercepted: true,
+        skipConverter: true,
+      };
+    }
     const validationTermination = evaluateSchemaValidationLoopGuard(
       toolLoopGuard,
       normalizedToolCall,
@@ -399,23 +425,6 @@ export async function handleToolLoopEventV1(
         intercepted: false,
         skipConverter: true,
         terminate: createSchemaValidationTermination(normalizedToolCall, compat.validation),
-      };
-    }
-    const reroutedWrite = tryRerouteEditToWrite(
-      normalizedToolCall,
-      compat,
-      allowedToolNames,
-      toolSchemaMap,
-    );
-    if (reroutedWrite) {
-      log.debug("Rerouting malformed edit call to write", {
-        missing: compat.validation.missing,
-        typeErrors: compat.validation.typeErrors,
-      });
-      await onInterceptedToolCall(reroutedWrite);
-      return {
-        intercepted: true,
-        skipConverter: true,
       };
     }
     if (
@@ -572,6 +581,7 @@ function evaluateToolLoopGuard(
   // Emit a hint to the model instead of killing the stream.
   // If the model ignores the hint and retries, subsequent triggers are hard kills.
   const isFirstTrigger = decision.repeatCount === decision.maxRepeat + 1;
+  const shouldSoftBlock = isFirstTrigger && isToolLoopSoftBlockEnabled();
 
   return {
     reason: "loop_guard",
@@ -583,7 +593,7 @@ function evaluateToolLoopGuard(
     repeatCount: decision.repeatCount,
     maxRepeat: decision.maxRepeat,
     errorClass: decision.errorClass,
-    soft: isFirstTrigger,
+    soft: shouldSoftBlock,
   };
 }
 
@@ -630,6 +640,7 @@ function evaluateSchemaValidationLoopGuard(
   }
 
   const isFirstTrigger = decision.repeatCount === decision.maxRepeat + 1;
+  const shouldSoftBlock = isFirstTrigger && isToolLoopSoftBlockEnabled();
 
   log.debug("Tool loop guard triggered on schema validation", {
     tool: toolCall.function.name,
@@ -650,7 +661,7 @@ function evaluateSchemaValidationLoopGuard(
     repeatCount: decision.repeatCount,
     maxRepeat: decision.maxRepeat,
     errorClass: decision.errorClass,
-    soft: isFirstTrigger,
+    soft: shouldSoftBlock,
   };
 }
 

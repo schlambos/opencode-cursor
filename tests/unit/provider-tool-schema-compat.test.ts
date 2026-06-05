@@ -4,6 +4,7 @@ import {
   applyToolSchemaCompat,
   buildToolSchemaMap,
   isFullFileShapedEditValidationFailure,
+  preprocessEditWriteArgs,
   tryRerouteEditToWrite,
 } from "../../src/provider/tool-schema-compat";
 
@@ -41,6 +42,35 @@ function buildEditWriteSchemaMap(writeUsesFilePath = false): Map<string, unknown
             },
             required: ["path", "content"],
           },
+    ],
+  ]);
+}
+
+function buildOpenCodeEditWriteSchemaMap(): Map<string, unknown> {
+  return new Map([
+    [
+      "edit",
+      {
+        type: "object",
+        properties: {
+          filePath: { type: "string" },
+          oldString: { type: "string" },
+          newString: { type: "string" },
+          replaceAll: { type: "boolean" },
+        },
+        required: ["filePath", "oldString", "newString"],
+      },
+    ],
+    [
+      "write",
+      {
+        type: "object",
+        properties: {
+          filePath: { type: "string" },
+          content: { type: "string" },
+        },
+        required: ["content", "filePath"],
+      },
     ],
   ]);
 }
@@ -801,6 +831,176 @@ describe("tool schema compatibility", () => {
       expect(args.content).toBe("updated body");
     });
 
+    it("tryRerouteEditToWrite returns write call when target path does not exist (file creation)", () => {
+      const toolSchemaMap = buildEditWriteSchemaMap(false);
+      const nonexistentPath = `/tmp/cursor-acp-reroute-nope-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+      const call = editToolCall({
+        path: nonexistentPath,
+        streamContent: "tiny content for a new file",
+      });
+      const compat = applyToolSchemaCompat(call, toolSchemaMap);
+      const rerouted = tryRerouteEditToWrite(
+        call,
+        compat,
+        new Set(["edit", "write"]),
+        toolSchemaMap,
+      );
+      expect(rerouted?.function.name).toBe("write");
+    });
+
+    it("tryRerouteEditToWrite translates streamContent to opencode edit when file exists with unique anchors", () => {
+      const { mkdtempSync, writeFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-translate-"));
+      const filePath = join(dir, "mod.rs");
+      // mirrors the real mod.rs case
+      const existing = [
+        "//! Snapshot service.",
+        "//!",
+        "//! Doc comment header.",
+        "",
+        "mod helpers;",
+        "",
+        "use aionui_common::{AppError, FileChangeOperation};",
+        "use dashmap::DashMap;",
+        "",
+        "// rest of file ...",
+        "",
+      ].join("\n");
+      writeFileSync(filePath, existing);
+      const streamContent = [
+        "mod helpers;",
+        "pub mod restore_plan;",
+        "",
+        "use aionui_common::{AppError, FileChangeOperation};",
+      ].join("\n");
+      try {
+        const toolSchemaMap = buildOpenCodeEditWriteSchemaMap();
+        const call = editToolCall({ path: filePath, streamContent });
+        const compat = applyToolSchemaCompat(call, toolSchemaMap);
+        const rerouted = tryRerouteEditToWrite(
+          call,
+          compat,
+          new Set(["edit", "write"]),
+          toolSchemaMap,
+        );
+        expect(rerouted?.function.name).toBe("edit");
+        const args = JSON.parse(rerouted?.function.arguments ?? "{}");
+        expect(args.filePath).toBe(filePath);
+        expect(args.oldString).toBe(
+          "mod helpers;\n\nuse aionui_common::{AppError, FileChangeOperation};",
+        );
+        expect(args.newString).toBe(streamContent);
+        expect(args.replaceAll).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("tryRerouteEditToWrite refuses when streamContent shares no lines with existing file", () => {
+      const { mkdtempSync, writeFileSync, readFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-noanchor-"));
+      const filePath = join(dir, "f.txt");
+      const existing = "alpha\nbeta\ngamma\ndelta\n";
+      const streamContent = "completely\ndifferent\ncontent\n";
+      writeFileSync(filePath, existing);
+      try {
+        const toolSchemaMap = buildOpenCodeEditWriteSchemaMap();
+        const call = editToolCall({ path: filePath, streamContent });
+        const compat = applyToolSchemaCompat(call, toolSchemaMap);
+        const rerouted = tryRerouteEditToWrite(
+          call,
+          compat,
+          new Set(["edit", "write"]),
+          toolSchemaMap,
+        );
+        expect(rerouted).toBeNull();
+        expect(readFileSync(filePath, "utf8")).toBe(existing);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("tryRerouteEditToWrite uses composite anchor to disambiguate when single line appears multiple times", () => {
+      const { mkdtempSync, writeFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-composite-"));
+      const filePath = join(dir, "f.txt");
+      const existing = [
+        "fn a() {",
+        "  return null;",
+        "}",
+        "",
+        "fn b() {",
+        "  let x = 1;",
+        "  return x;",
+        "}",
+        "",
+        "fn c() {",
+        "  return null;",
+        "}",
+        "",
+      ].join("\n");
+      // streamContent edits fn b — start anchor "fn b() {" is unique, no composite needed
+      const streamContent = [
+        "fn b() {",
+        "  let x = 2;",
+        "  return x * 2;",
+        "}",
+      ].join("\n");
+      writeFileSync(filePath, existing);
+      try {
+        const toolSchemaMap = buildOpenCodeEditWriteSchemaMap();
+        const call = editToolCall({ path: filePath, streamContent });
+        const compat = applyToolSchemaCompat(call, toolSchemaMap);
+        const rerouted = tryRerouteEditToWrite(
+          call,
+          compat,
+          new Set(["edit", "write"]),
+          toolSchemaMap,
+        );
+        expect(rerouted?.function.name).toBe("edit");
+        const args = JSON.parse(rerouted?.function.arguments ?? "{}");
+        expect(args.oldString).toBe([
+          "fn b() {",
+          "  let x = 1;",
+          "  return x;",
+          "}",
+        ].join("\n"));
+        expect(args.newString).toBe(streamContent);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("tryRerouteEditToWrite returns null when streamContent is identical to existing", () => {
+      const { mkdtempSync, writeFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-noop-"));
+      const filePath = join(dir, "f.txt");
+      const existing = "a\nb\nc\n";
+      writeFileSync(filePath, existing);
+      try {
+        const toolSchemaMap = buildOpenCodeEditWriteSchemaMap();
+        const call = editToolCall({ path: filePath, streamContent: existing });
+        const compat = applyToolSchemaCompat(call, toolSchemaMap);
+        const rerouted = tryRerouteEditToWrite(
+          call,
+          compat,
+          new Set(["edit", "write"]),
+          toolSchemaMap,
+        );
+        expect(rerouted).toBeNull();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("isFullFileShapedEditValidationFailure true only for full-file shape", () => {
       const toolSchemaMap = buildEditWriteSchemaMap(false);
       const fullFileCall = editToolCall({ path: "/tmp/x", content: "body" });
@@ -963,5 +1163,106 @@ describe("tool schema compatibility", () => {
     expect(args.content).toBe("hello");
     expect(args.new_string).toBeUndefined();
     expect(result.validation.ok).toBe(true);
+  });
+
+  describe("preprocessEditWriteArgs (hook-side translation)", () => {
+    it("aliases filePath/oldString/newString to snake_case for edit", () => {
+      const out = preprocessEditWriteArgs("edit", {
+        filePath: "/tmp/x.txt",
+        oldString: "alpha",
+        newString: "beta",
+      });
+      expect(out.path).toBe("/tmp/x.txt");
+      expect(out.old_string).toBe("alpha");
+      expect(out.new_string).toBe("beta");
+    });
+
+    it("aliases filePath to path for write", () => {
+      const out = preprocessEditWriteArgs("write", {
+        filePath: "/tmp/x.txt",
+        content: "body",
+      });
+      expect(out.path).toBe("/tmp/x.txt");
+      expect(out.content).toBe("body");
+    });
+
+    it("translates streamContent edit on existing file to old_string/new_string", () => {
+      const { mkdtempSync, writeFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-hook-translate-"));
+      const filePath = join(dir, "mod.rs");
+      writeFileSync(
+        filePath,
+        [
+          "//! Doc header.",
+          "",
+          "mod helpers;",
+          "",
+          "use foo::bar;",
+          "",
+          "fn main() {}",
+          "",
+        ].join("\n"),
+      );
+      try {
+        const out = preprocessEditWriteArgs("edit", {
+          filePath,
+          streamContent: ["mod helpers;", "pub mod restore_plan;", "", "use foo::bar;"].join("\n"),
+        });
+        expect(out.path).toBe(filePath);
+        expect(out.old_string).toBe("mod helpers;\n\nuse foo::bar;");
+        expect(out.new_string).toBe(
+          "mod helpers;\npub mod restore_plan;\n\nuse foo::bar;",
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("blocks full-file overwrite when streamContent edit can't be anchored on an existing file", () => {
+      const { mkdtempSync, writeFileSync, rmSync } = require("fs") as typeof import("fs");
+      const { tmpdir } = require("os") as typeof import("os");
+      const { join } = require("path") as typeof import("path");
+      const dir = mkdtempSync(join(tmpdir(), "cursor-acp-hook-block-"));
+      const filePath = join(dir, "f.txt");
+      writeFileSync(filePath, "alpha\nbeta\ngamma\n");
+      try {
+        // streamContent shares no lines with existing → can't anchor
+        const out = preprocessEditWriteArgs("edit", {
+          filePath,
+          streamContent: "completely\ndifferent\ncontent\n",
+        });
+        // We set old_string to a sentinel that won't match, so the registry
+        // handler will return "Could not find the text to replace" rather
+        // than performing a full overwrite via its empty-old_string branch.
+        expect(typeof out.old_string).toBe("string");
+        expect(out.old_string).not.toBe("");
+        expect(out.new_string).toBe("completely\ndifferent\ncontent\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves args untouched for non-edit/write tools", () => {
+      const out = preprocessEditWriteArgs("shell", { command: "ls", filePath: "/tmp/x" });
+      expect(out.command).toBe("ls");
+      // filePath should remain because preprocessing only kicks in for edit/write
+      expect(out.filePath).toBe("/tmp/x");
+      expect(out.path).toBeUndefined();
+    });
+
+    it("leaves args untouched when target file does not exist (creation path)", () => {
+      const nonexistent = `/tmp/cursor-acp-create-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+      const out = preprocessEditWriteArgs("edit", {
+        filePath: nonexistent,
+        streamContent: "fresh content\n",
+      });
+      expect(out.path).toBe(nonexistent);
+      // new_string filled from streamContent, but no old_string set (handler
+      // will create the file via its ENOENT branch).
+      expect(out.new_string).toBe("fresh content\n");
+      expect(out.old_string).toBeUndefined();
+    });
   });
 });

@@ -57,7 +57,7 @@ import {
 import { handleToolLoopEventWithFallback } from "./provider/runtime-interception.js";
 import { PassThroughTracker } from "./provider/passthrough-tracker.js";
 import { toastService } from "./services/toast-service.js";
-import { buildToolSchemaMap } from "./provider/tool-schema-compat.js";
+import { buildToolSchemaMap, preprocessEditWriteArgs } from "./provider/tool-schema-compat.js";
 import {
   createToolLoopGuard,
   parseToolLoopMaxRepeat,
@@ -1798,9 +1798,10 @@ function buildToolHookEntries(registry: CoreRegistry, fallbackBaseDir?: string):
         args: zodArgs,
         async execute(args: any, context: any) {
           try {
+            const preprocessed = preprocessEditWriteArgs(toolName, args ?? {});
             const normalizedArgs = applyToolContextDefaults(
               toolName,
-              args,
+              preprocessed,
               context,
               fallbackBaseDir,
               sessionWorkspaceBySession,

@@ -82,6 +82,129 @@ describe("tool loop guard", () => {
     expect(calls[6].maxRepeat).toBe(6);
   });
 
+  it("does not trip coarse fingerprint in evaluate() across distinct edit paths (per-path counter)", () => {
+    // Regression: the non-validation evaluate() path also tracks coarse
+    // ${tool}|${errorClass} globally. For repeated edit calls whose history
+    // result classifies as "validation" (e.g. "missing required argument"
+    // tool result), the coarse counter accumulated across files just like
+    // the validation-path bug. Per-path key fixes it the same way.
+    //
+    // We seed history with prior failed edit calls (8 distinct paths, each
+    // with a "validation"-class tool result). Then a fresh edit call should
+    // not be flagged as a coarse-loop, since each file's counter is at 1.
+    const historyMessages: Array<unknown> = [];
+    for (let i = 0; i < 8; i++) {
+      const path = `/repo/src/seed_${i}.ts`;
+      historyMessages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: `prev-${i}`,
+            type: "function",
+            function: {
+              name: "edit",
+              arguments: JSON.stringify({ path }),
+            },
+          },
+        ],
+      });
+      historyMessages.push({
+        role: "tool",
+        tool_call_id: `prev-${i}`,
+        content: "edit: missing required argument 'old_string'",
+      });
+    }
+    const guard = createToolLoopGuard(historyMessages, 2);
+
+    // A fresh edit call on a new path: should not be coarse-triggered.
+    const decision = guard.evaluate({
+      id: "new-1",
+      type: "function",
+      function: {
+        name: "edit",
+        arguments: JSON.stringify({ path: "/repo/src/new.ts", content: "x" }),
+      },
+    });
+
+    expect(decision.triggered).toBe(false);
+  });
+
+  it("does not trip coarse fingerprint across distinct edit paths (per-path counter)", () => {
+    // Regression: cursor Composer emits edit({path, streamContent}) for each new
+    // file in a multi-file task. Each fails opencode's edit schema with
+    // missing:old_string and is rerouted to write. Before the per-path coarse
+    // fingerprint fix, every such failure ticked the global `edit|validation`
+    // counter and tripped the guard after 7 file creations even though each
+    // call was a distinct legitimate file.
+    const guard = createToolLoopGuard([], 2);
+
+    // Use distinct validation signatures per call to isolate the coarse
+    // fingerprint behavior (otherwise strict count would trip at call 3).
+    const paths = [
+      "/repo/src/a.ts",
+      "/repo/src/b.ts",
+      "/repo/src/c.ts",
+      "/repo/src/d.ts",
+      "/repo/src/e.ts",
+      "/repo/src/f.ts",
+      "/repo/src/g.ts",
+      "/repo/src/h.ts",
+    ];
+    const results = paths.map((path, i) =>
+      guard.evaluateValidation(
+        {
+          id: `c${i + 1}`,
+          type: "function",
+          function: {
+            name: "edit",
+            arguments: JSON.stringify({ path, content: "irrelevant" }),
+          },
+        },
+        `missing:field_${i}`,
+      ),
+    );
+
+    expect(results.every((r) => !r.triggered)).toBe(true);
+  });
+
+  it("still trips coarse fingerprint when the same edit path repeats with varied signatures", () => {
+    // Same file getting hammered with different malformed shapes should still
+    // trip the coarse fingerprint — that's the original spray-and-pray
+    // detection the coarse counter exists for.
+    const guard = createToolLoopGuard([], 2);
+
+    const signatures = [
+      "missing: path",
+      "missing: old_string",
+      "unsupported: content",
+      "missing: new_string",
+      "type: path must be string",
+      "missing: path, old_string",
+      "unsupported: streamContent",
+    ];
+    const path = "/repo/src/contested.ts";
+    const results = signatures.map((sig, i) =>
+      guard.evaluateValidation(
+        {
+          id: `c${i + 1}`,
+          type: "function",
+          function: {
+            name: "edit",
+            arguments: JSON.stringify({ path, junk: i }),
+          },
+        },
+        sig,
+      ),
+    );
+
+    expect(results.slice(0, 6).every((r) => !r.triggered)).toBe(true);
+    expect(results[6].triggered).toBe(true);
+    expect(results[6].fingerprint).toMatch(/^edit\|path:[0-9a-f]{8}\|validation$/);
+    expect(results[6].repeatCount).toBe(7);
+    expect(results[6].maxRepeat).toBe(6);
+  });
+
   it("tracks repeated identical successful tool calls and triggers after threshold", () => {
     const guard = createToolLoopGuard(
       [
@@ -431,7 +554,13 @@ describe("tool loop guard", () => {
     expect(third.errorClass).toBe("validation");
   });
 
-  it("seeds validation guard history for repeated malformed edit calls", () => {
+  it("does not seed validation guard history for malformed edits with no tool result (rerouted)", () => {
+    // Updated contract: a prior assistant edit call WITHOUT a matching tool
+    // result means the call was rerouted by the plugin (e.g. to write) and
+    // succeeded; opencode never produced an edit tool result for it. These
+    // calls must not seed the validation guard counter — otherwise a model
+    // that legitimately appends to one file across many turns trips on its
+    // own past successes.
     const guard = createToolLoopGuard(
       [
         {
@@ -447,6 +576,50 @@ describe("tool loop guard", () => {
               },
             },
           ],
+        },
+      ],
+      1,
+    );
+
+    const decision = guard.evaluateValidation(
+      {
+        id: "next-edit",
+        type: "function",
+        function: {
+          name: "edit",
+          arguments: "{\"path\":\"TODO.md\",\"content\":\"rewrite again\"}",
+        },
+      },
+      "missing:old_string,new_string",
+    );
+
+    expect(decision.triggered).toBe(false);
+  });
+
+  it("seeds validation guard history for malformed edits that DID fail (tool result is validation error)", () => {
+    // True validation failures (the model retried unrepairable edits and got
+    // an actual "missing required argument" tool result back) should still be
+    // counted toward the guard.
+    const guard = createToolLoopGuard(
+      [
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "prev-edit",
+              type: "function",
+              function: {
+                name: "edit",
+                arguments: "{\"path\":\"TODO.md\",\"content\":\"full rewrite\"}",
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: "prev-edit",
+          content: "edit: missing required argument 'old_string'",
         },
       ],
       1,
@@ -783,10 +956,11 @@ describe("EXPLORATION_TOOLS coarse tracking", () => {
     }
   });
 
-  it("edit (non-exploration tool): 7 different-path calls with validation errors trigger via coarse", () => {
-    // coarseMaxRepeat = maxRepeat(2) * COARSE_LIMIT_MULTIPLIER(3) = 6
-    // Need > 6 to trigger coarse. Use 7 evaluateValidation calls with distinct signatures.
-    // evaluateValidation always uses "validation" errorClass (bypasses UNKNOWN_AS_SUCCESS_TOOLS).
+  it("edit (non-exploration tool): 7 different-path calls with validation errors do NOT trip coarse (per-path counter)", () => {
+    // Updated contract: the coarse validation fingerprint for edit/write is
+    // per-path (edit|path:HASH|validation) so multi-file work can't trip a
+    // global counter just by validating-and-rerouting many distinct files.
+    // Same-path spam still trips (see test below).
     const guard = createToolLoopGuard([], 2);
     let last!: ReturnType<typeof guard.evaluate>;
     for (let i = 0; i < 7; i++) {
@@ -795,9 +969,9 @@ describe("EXPLORATION_TOOLS coarse tracking", () => {
         type: "function" as const,
         function: { name: "edit", arguments: JSON.stringify({ path: `file${i}.ts`, old_string: `old${i}`, new_string: "new" }) },
       };
-      // Use unique validation signature per call so strict count stays at 1 each
+      // Distinct validation signatures so strict counter stays at 1 each.
       last = guard.evaluateValidation(call, `missing:field_${i}`);
     }
-    expect(last.triggered).toBe(true); // coarse: count=7 > coarseMax=6
+    expect(last.triggered).toBe(false);
   });
 });

@@ -1013,7 +1013,7 @@ describe("graduated response (soft/hard termination)", () => {
         type: "function",
         function: { name: "edit", arguments: '{"path":"TODO.md"}' },
       },
-      "missing:old_string,new_string",
+      "missing:new_string,old_string",
     );
 
     const toolResults: any[] = [];
@@ -1057,6 +1057,69 @@ describe("graduated response (soft/hard termination)", () => {
     expect(result.intercepted).toBe(false);
     expect(result.skipConverter).toBe(true);
     expect(toolResults.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("hard-stops schema validation guard when soft blocking is disabled", async () => {
+    const previous = process.env.CURSOR_ACP_TOOL_LOOP_SOFT_BLOCK;
+    process.env.CURSOR_ACP_TOOL_LOOP_SOFT_BLOCK = "false";
+    try {
+      const guard = createToolLoopGuard([], 1);
+      guard.evaluateValidation(
+        {
+          id: "e1",
+          type: "function",
+          function: { name: "edit", arguments: '{"path":"TODO.md"}' },
+        },
+        "missing:new_string,old_string",
+      );
+
+      const toolResults: any[] = [];
+      const result = await handleToolLoopEventV1({
+        ...createBaseOptions({
+          event: {
+            type: "tool_call",
+            call_id: "e2",
+            tool_call: {
+              editToolCall: {
+                args: { path: "TODO.md" },
+              },
+            },
+          } as any,
+          allowedToolNames: new Set(["edit"]),
+          toolSchemaMap: new Map([
+            [
+              "edit",
+              {
+                type: "object",
+                properties: {
+                  path: { type: "string" },
+                  old_string: { type: "string" },
+                  new_string: { type: "string" },
+                },
+                required: ["path", "old_string", "new_string"],
+                additionalProperties: false,
+              },
+            ],
+          ]),
+          toolLoopGuard: guard,
+          onToolResult: async (toolResult) => {
+            toolResults.push(toolResult);
+          },
+        }),
+        boundary: createProviderBoundary("v1", "cursor-acp"),
+      });
+
+      expect(result.terminate).toBeDefined();
+      expect(result.terminate?.reason).toBe("loop_guard");
+      expect((result.terminate as any)?.soft).toBe(false);
+      expect(toolResults).toHaveLength(0);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.CURSOR_ACP_TOOL_LOOP_SOFT_BLOCK;
+      } else {
+        process.env.CURSOR_ACP_TOOL_LOOP_SOFT_BLOCK = previous;
+      }
+    }
   });
 
   it("success loop termination remains silent (not soft)", async () => {

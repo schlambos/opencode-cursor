@@ -156,7 +156,12 @@ export function createToolLoopGuard(
         };
       }
       const strictFingerprint = `${toolCall.function.name}|${argShape}|${errorClass}`;
-      const coarseFingerprint = `${toolCall.function.name}|${errorClass}`;
+      const perPathCoarse = derivePerPathCoarseFingerprint(
+        toolCall.function.name,
+        toolCall.function.arguments,
+        errorClass,
+      );
+      const coarseFingerprint = perPathCoarse ?? `${toolCall.function.name}|${errorClass}`;
 
       return evaluateWithFingerprints(
         toolCall.function.name,
@@ -173,7 +178,11 @@ export function createToolLoopGuard(
     evaluateValidation(toolCall, validationSignature) {
       const normalizedSignature = normalizeValidationSignature(validationSignature);
       const strictFingerprint = `${toolCall.function.name}|schema:${normalizedSignature}|validation`;
-      const coarseFingerprint = `${toolCall.function.name}|validation`;
+      const perPathCoarse = deriveValidationCoarseFingerprint(
+        toolCall.function.name,
+        toolCall.function.arguments,
+      );
+      const coarseFingerprint = perPathCoarse ?? `${toolCall.function.name}|validation`;
       return evaluateWithFingerprints(
         toolCall.function.name,
         "validation",
@@ -289,18 +298,17 @@ function indexToolLoopHistory(messages: Array<unknown>): {
       if (coarseSuccessFP) {
         incrementCount(initialCoarseCounts, coarseSuccessFP);
       }
-
-      if (schemaSignature) {
-        incrementCount(
-          initialValidationCounts,
-          `${call.name}|schema:${schemaSignature}|validation`,
-        );
-        incrementCount(initialValidationCoarseCounts, `${call.name}|validation`);
-      }
+      // Note: previously this branch also seeded validation counters when the
+      // call had a missing-required-arg schemaSignature, which double-counted
+      // edits that were rerouted to write and succeeded. Removed so that the
+      // validation guard only tracks calls whose tool result is actually a
+      // validation failure (handled in the non-success branch below).
       continue;
     }
     const strictFingerprint = `${call.name}|${call.argShape}|${errorClass}`;
-    const coarseFingerprint = `${call.name}|${errorClass}`;
+    const coarseFingerprint =
+      derivePerPathCoarseFingerprint(call.name, call.rawArguments, errorClass)
+      ?? `${call.name}|${errorClass}`;
     incrementCount(initialCounts, strictFingerprint);
     incrementCount(initialCoarseCounts, coarseFingerprint);
     if (!schemaSignature) {
@@ -310,7 +318,11 @@ function indexToolLoopHistory(messages: Array<unknown>): {
       initialValidationCounts,
       `${call.name}|schema:${schemaSignature}|validation`,
     );
-    incrementCount(initialValidationCoarseCounts, `${call.name}|validation`);
+    incrementCount(
+      initialValidationCoarseCounts,
+      deriveValidationCoarseFingerprint(call.name, call.rawArguments)
+        ?? `${call.name}|validation`,
+    );
   }
 
   return {
@@ -381,6 +393,34 @@ function deriveArgumentValueSignature(rawArguments: string): string {
   } catch {
     return `invalid:${hashString(rawArguments)}`;
   }
+}
+
+function derivePerPathCoarseFingerprint(
+  toolName: string,
+  rawArguments: string,
+  errorClass: string,
+): string | null {
+  const lowered = toolName.toLowerCase();
+  if (lowered !== "edit" && lowered !== "write") {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(rawArguments);
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    const path = typeof parsed.path === "string" ? parsed.path : "";
+    if (!path) {
+      return null;
+    }
+    return `${toolName}|path:${hashString(path)}|${errorClass}`;
+  } catch {
+    return null;
+  }
+}
+
+function deriveValidationCoarseFingerprint(toolName: string, rawArguments: string): string | null {
+  return derivePerPathCoarseFingerprint(toolName, rawArguments, "validation");
 }
 
 function deriveSuccessCoarseFingerprint(toolName: string, rawArguments: string): string | null {

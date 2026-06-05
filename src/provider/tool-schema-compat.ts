@@ -1,4 +1,8 @@
+import * as fs from "fs";
+import { createLogger } from "../utils/logger.js";
 import type { OpenAiToolCall } from "../proxy/tool-loop.js";
+
+const log = createLogger("provider:tool-schema-compat");
 
 type JsonRecord = Record<string, unknown>;
 
@@ -148,7 +152,38 @@ function buildWriteArguments(
   return { path: filePath, content };
 }
 
-/** Malformed full-file edit (path + body, no old_string) → write tool call when write is available. */
+function buildEditArguments(
+  filePath: string,
+  oldString: string,
+  newString: string,
+  editSchema: unknown,
+): JsonRecord {
+  const useCamelCase = (() => {
+    if (!isRecord(editSchema)) return true;
+    const required = Array.isArray(editSchema.required)
+      ? editSchema.required.filter((value): value is string => typeof value === "string")
+      : [];
+    if (required.includes("oldString") || required.includes("newString") || required.includes("filePath")) {
+      return true;
+    }
+    if (required.includes("old_string") || required.includes("new_string") || required.includes("path")) {
+      return false;
+    }
+    return true;
+  })();
+  return useCamelCase
+    ? { filePath, oldString, newString, replaceAll: false }
+    : { path: filePath, old_string: oldString, new_string: newString, replace_all: false };
+}
+
+/**
+ * Translate a malformed edit (path + body, no old_string) into a real edit/write
+ * call. Tier 1: file does not exist → write (creation). Tier 2: file exists →
+ * opencode edit with anchor-derived oldString/newString. Tier 3: refuse (null).
+ *
+ * Replaces the old "always reroute to write" behavior, which caused destructive
+ * truncations when cursor's Composer emitted a partial streamContent chunk.
+ */
 export function tryRerouteEditToWrite(
   toolCall: OpenAiToolCall,
   compat: ToolSchemaCompatResult,
@@ -196,6 +231,48 @@ export function tryRerouteEditToWrite(
     return null;
   }
 
+  // Tier 2: file exists → try to translate to opencode edit using anchors.
+  let existing: string | null = null;
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.isFile()) {
+      existing = fs.readFileSync(filePath, "utf8");
+    }
+  } catch {
+    // ENOENT / permission / etc. — fall through to Tier 1.
+  }
+
+  if (existing !== null) {
+    if (allowedToolNames.has("edit") && toolSchemaMap.has("edit")) {
+      const editSchema = toolSchemaMap.get("edit");
+      const translated = translateStreamContentToEdit(existing, content);
+      if (translated) {
+        log.debug("Translated streamContent edit to opencode edit", {
+          path: filePath,
+          oldStringLen: translated.oldString.length,
+          newStringLen: translated.newString.length,
+        });
+        return {
+          ...toolCall,
+          function: {
+            name: "edit",
+            arguments: JSON.stringify(
+              buildEditArguments(filePath, translated.oldString, translated.newString, editSchema),
+            ),
+          },
+        };
+      }
+    }
+    // Tier 3: file exists but can't translate. Refuse — caller emits a hint.
+    log.warn("Refusing reroute: cannot anchor streamContent in existing file", {
+      path: filePath,
+      existingLen: existing.length,
+      streamContentLen: content.length,
+    });
+    return null;
+  }
+
+  // Tier 1: file does not exist → write (creation).
   return {
     ...toolCall,
     function: {
@@ -203,6 +280,211 @@ export function tryRerouteEditToWrite(
       arguments: JSON.stringify(buildWriteArguments(filePath, content, writeSchema)),
     },
   };
+}
+
+/**
+ * Pre-process the args a model emitted for `edit` or `write`, before they reach
+ * the local registry's tool handler in `plugin.ts:createEntry`. This is a sibling
+ * fix to the proxy-boundary translation in `tryRerouteEditToWrite`: some edit
+ * calls bypass the proxy boundary entirely (parallel tool emissions in one
+ * model turn) and arrive at the hook handler with cursor-native shapes the
+ * local registry doesn't understand. We normalize and, when possible, translate
+ * here so the handler sees args it can execute.
+ *
+ * - Aliases `filePath` → `path`, `oldString` → `old_string`, `newString` → `new_string`.
+ * - For edit with a body but no old_string AND an existing file: try to derive
+ *   old_string + new_string from anchors in the file (same algorithm as the
+ *   proxy-side translator).
+ * - Otherwise leaves args untouched. The handler will throw or create-on-ENOENT
+ *   as appropriate.
+ */
+export function preprocessEditWriteArgs(toolName: string, args: JsonRecord): JsonRecord {
+  const lowered = toolName.toLowerCase();
+  if (lowered !== "edit" && lowered !== "write") {
+    return args;
+  }
+  const out: JsonRecord = { ...args };
+
+  if (typeof out.filePath === "string" && typeof out.path !== "string") {
+    out.path = out.filePath;
+  }
+  if (lowered === "edit") {
+    if (typeof out.oldString === "string" && typeof out.old_string !== "string") {
+      out.old_string = out.oldString;
+    }
+    if (typeof out.newString === "string" && typeof out.new_string !== "string") {
+      out.new_string = out.newString;
+    }
+    if (typeof out.new_string !== "string") {
+      const fallback = typeof out.content === "string"
+        ? out.content
+        : typeof out.streamContent === "string"
+          ? out.streamContent
+          : null;
+      if (fallback !== null) {
+        out.new_string = fallback;
+      }
+    }
+    // If the model emitted a body but no old_string, and the file exists, try
+    // anchor-based translation so the registry's edit handler can apply the
+    // change in-place instead of overwriting (its empty-old_string branch is
+    // a full file replace, which is what truncated mod.rs earlier).
+    if (
+      typeof out.path === "string"
+      && out.path.length > 0
+      && typeof out.new_string === "string"
+      && typeof out.old_string !== "string"
+    ) {
+      let existing: string | null = null;
+      try {
+        const stat = fs.statSync(out.path);
+        if (stat.isFile()) {
+          existing = fs.readFileSync(out.path, "utf8");
+        }
+      } catch {
+        // File doesn't exist — leave as-is, registry will create.
+      }
+      if (existing !== null) {
+        const translated = translateStreamContentToEdit(existing, out.new_string);
+        if (translated) {
+          log.debug("Preprocessed edit args: translated streamContent to old_string/new_string", {
+            path: out.path,
+            oldStringLen: translated.oldString.length,
+            newStringLen: translated.newString.length,
+          });
+          out.old_string = translated.oldString;
+          out.new_string = translated.newString;
+        } else {
+          // File exists but can't anchor — refuse to silently rewrite. Set
+          // old_string to a sentinel that can't match so the registry's edit
+          // returns "Could not find the text to replace" instead of treating
+          // empty old_string as a full overwrite.
+          log.warn("Preprocessed edit args: cannot anchor streamContent, blocking full-file overwrite", {
+            path: out.path,
+            newStringLen: out.new_string.length,
+          });
+          out.old_string = " __cursor_acp_unmappable_edit__ ";
+        }
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Find oldString/newString such that opencode's edit can apply the model's
+ * intended localized change. Returns null if a start anchor can't be uniquely
+ * placed or an end anchor isn't found after it.
+ *
+ * Algorithm:
+ * 1. Pick a "start anchor" — the first non-blank line of streamContent that
+ *    appears exactly once in existing. If single-line is ambiguous, expand to a
+ *    2-line then 3-line composite (candidate + following streamContent lines)
+ *    and re-check uniqueness. Give up at 3 lines.
+ * 2. Pick an "end anchor" — streamContent's last non-blank line, and find the
+ *    FIRST occurrence in existing starting from the start-anchor's position.
+ *    Doesn't have to be unique globally — anchoring from the start position
+ *    disambiguates well enough for the localized-edit case.
+ * 3. oldString = existing slice from start of start-anchor's first line to end
+ *    of end-anchor's line. newString = streamContent verbatim.
+ */
+function translateStreamContentToEdit(
+  existing: string,
+  streamContent: string,
+): { oldString: string; newString: string } | null {
+  if (existing === streamContent) {
+    return null;
+  }
+  const existingLines = existing.split("\n");
+  const newLines = streamContent.split("\n");
+
+  const startAnchor = findStartAnchor(existingLines, newLines);
+  if (!startAnchor) return null;
+
+  const endLineInExisting = findEndAnchor(existingLines, newLines, startAnchor.existingStartLine);
+  if (endLineInExisting === -1) return null;
+
+  if (endLineInExisting < startAnchor.existingStartLine) {
+    return null;
+  }
+
+  const oldString = existingLines.slice(startAnchor.existingStartLine, endLineInExisting + 1).join("\n");
+  const newString = streamContent;
+
+  if (oldString === newString) return null;
+  if (!existing.includes(oldString)) return null;
+
+  return { oldString, newString };
+}
+
+type StartAnchorResult = {
+  streamStartLine: number;
+  existingStartLine: number;
+};
+
+/**
+ * Find a non-blank line of streamContent that appears uniquely in existing.
+ * Walks forward through streamContent's candidate lines. For each candidate,
+ * tries 1-line, 2-line, 3-line composites (the candidate + following lines)
+ * and returns the smallest unique match. Gives up if a candidate's
+ * single-line position has 0 matches (can't disambiguate) or if all candidates
+ * are exhausted.
+ */
+function findStartAnchor(existingLines: string[], newLines: string[]): StartAnchorResult | null {
+  for (let candidateIdx = 0; candidateIdx < newLines.length; candidateIdx++) {
+    if (newLines[candidateIdx].trim().length === 0) continue;
+
+    for (let size = 1; size <= 3; size++) {
+      const end = candidateIdx + size - 1;
+      if (end >= newLines.length) break;
+      const composite = newLines.slice(candidateIdx, end + 1);
+      const positions = findCompositePositions(existingLines, composite);
+      if (positions.length === 1) {
+        return { streamStartLine: candidateIdx, existingStartLine: positions[0] };
+      }
+      if (positions.length === 0) break;
+    }
+  }
+  return null;
+}
+
+/**
+ * Find the line in existing (at or after `startLine`) that matches
+ * streamContent's last non-blank line. First match wins — anchoring from the
+ * start anchor's known position handles disambiguation in practice.
+ */
+function findEndAnchor(existingLines: string[], newLines: string[], startLine: number): number {
+  let endCandidate = -1;
+  for (let i = newLines.length - 1; i >= 0; i--) {
+    if (newLines[i].trim().length > 0) {
+      endCandidate = i;
+      break;
+    }
+  }
+  if (endCandidate === -1) return -1;
+  const target = newLines[endCandidate];
+  for (let i = startLine; i < existingLines.length; i++) {
+    if (existingLines[i] === target) return i;
+  }
+  return -1;
+}
+
+function findCompositePositions(existingLines: string[], composite: string[]): number[] {
+  if (composite.length === 0) return [];
+  const out: number[] = [];
+  const limit = existingLines.length - composite.length + 1;
+  for (let i = 0; i < limit; i++) {
+    let match = true;
+    for (let j = 0; j < composite.length; j++) {
+      if (existingLines[i + j] !== composite[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) out.push(i);
+  }
+  return out;
 }
 
 function parseArguments(rawArguments: string): JsonRecord {
@@ -550,10 +832,23 @@ function buildEditFullFileHint(
     return null;
   }
 
-  const missingOldStringOnly =
-    (missing.includes("old_string") || missing.includes("oldString"))
-    && missing.every((key) => key === "old_string" || key === "oldString");
-  if (!missingOldStringOnly) {
+  const missingHasOldString = missing.includes("old_string") || missing.includes("oldString");
+  if (!missingHasOldString) {
+    return null;
+  }
+  // The other missing keys are accepted as long as the normalized args have a
+  // path-like and body-like value — they're typically filePath/newString
+  // counterparts of the compat layer's snake_case bias against opencode's
+  // camelCase schema.
+  const benignMissingKeys = new Set([
+    "old_string",
+    "oldString",
+    "new_string",
+    "newString",
+    "path",
+    "filePath",
+  ]);
+  if (!missing.every((key) => benignMissingKeys.has(key))) {
     return null;
   }
 
