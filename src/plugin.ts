@@ -874,15 +874,27 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?: 
               log.debug("Intercepted OpenCode tool call (stream)", {
                 name: toolCall.function.name,
                 callId: toolCall.id,
+                argsPreview: typeof toolCall.function.arguments === "string"
+                  ? toolCall.function.arguments.slice(0, 200)
+                  : null,
               });
               const streamChunks = boundaryContext.run(
                 "createStreamToolCallChunks",
                 (boundary) =>
                   boundary.createStreamToolCallChunks({ id, created, model }, toolCall),
               );
+              // DIAG: log every SSE chunk we send to opencode so we can see
+              // exactly what reaches ai-sdk's tool dispatcher.
               for (const chunk of streamChunks) {
+                try {
+                  log.debug("SSE chunk emitted to opencode (intercept)", {
+                    callId: toolCall.id,
+                    chunkPreview: JSON.stringify(chunk).slice(0, 400),
+                  });
+                } catch { /* ignore */ }
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
               }
+              log.debug("SSE [DONE] emitted to opencode (intercept)", { callId: toolCall.id });
               controller.enqueue(encoder.encode(formatSseDone()));
               streamTerminated = true;
               try {
@@ -1371,15 +1383,26 @@ async function ensureCursorProxyServer(workspaceDirectory: string, toolRouter?: 
           log.debug("Intercepted OpenCode tool call (stream)", {
             name: toolCall.function.name,
             callId: toolCall.id,
+            argsPreview: typeof toolCall.function.arguments === "string"
+              ? toolCall.function.arguments.slice(0, 200)
+              : null,
           });
           const streamChunks = boundaryContext.run(
             "createStreamToolCallChunks",
             (boundary) =>
               boundary.createStreamToolCallChunks({ id, created, model }, toolCall),
           );
+          // DIAG: log every SSE chunk we send to opencode (raw-mode path).
           for (const chunk of streamChunks) {
+            try {
+              log.debug("SSE chunk emitted to opencode (intercept,raw)", {
+                callId: toolCall.id,
+                chunkPreview: JSON.stringify(chunk).slice(0, 400),
+              });
+            } catch { /* ignore */ }
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           }
+          log.debug("SSE [DONE] emitted to opencode (intercept,raw)", { callId: toolCall.id });
           res.write(formatSseDone());
           streamTerminated = true;
           res.end();
@@ -1797,6 +1820,25 @@ function buildToolHookEntries(registry: CoreRegistry, fallbackBaseDir?: string):
         description: t.description,
         args: zodArgs,
         async execute(args: any, context: any) {
+          // DIAG: log exactly what opencode invokes the hook with, so we can
+          // see whether ai-sdk is passing assembled-tool-call args, partial
+          // streaming args, or something else.
+          try {
+            const argKeys = args && typeof args === "object" ? Object.keys(args) : [];
+            const callIdFromCtx =
+              (context && typeof context.callID === "string" && context.callID)
+              || (context && typeof context.toolCallId === "string" && context.toolCallId)
+              || null;
+            log.debug("createEntry execute invoked", {
+              tool: toolName,
+              argKeys,
+              argsPreview: (() => {
+                try { return JSON.stringify(args).slice(0, 400); }
+                catch { return null; }
+              })(),
+              callId: callIdFromCtx,
+            });
+          } catch { /* ignore */ }
           try {
             const preprocessed = preprocessEditWriteArgs(toolName, args ?? {});
             const normalizedArgs = applyToolContextDefaults(

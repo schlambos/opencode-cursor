@@ -9,6 +9,9 @@ import {
   type StreamJsonToolCallEvent,
 } from "./types.js";
 import { MixedDeltaTracker } from "./delta-tracker.js";
+import { createLogger } from "../utils/logger.js";
+
+const log = createLogger("streaming:openai-sse");
 
 type OpenAiToolCall = {
   index: number;
@@ -84,7 +87,21 @@ export class StreamToSseConverter {
     }
 
     if (isToolCall(event)) {
-      return [this.chunkWith(this.toolCallDelta(event))];
+      // DIAG: log every converter-path tool_call emission so we can see
+      // whether the original tool_call (e.g. "edit") ever leaks through to
+      // opencode in parallel with an intercept's rerouted call (e.g. "write").
+      const delta = this.toolCallDelta(event);
+      try {
+        const tc = delta.tool_calls?.[0];
+        log.debug("Converter emitted tool_call SSE chunk", {
+          callId: tc?.id,
+          name: tc?.function?.name,
+          argsPreview: typeof tc?.function?.arguments === "string"
+            ? tc.function.arguments.slice(0, 200)
+            : null,
+        });
+      } catch { /* ignore */ }
+      return [this.chunkWith(delta)];
     }
 
     return [];
